@@ -1,0 +1,9 @@
+# .htaccess
+Options +Includes
+AddType text/html .shtml
+AddHandler server-parsed .shtml
+
+<FilesMatch "\.(py|yml|log|so|pwd|keepalive)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>

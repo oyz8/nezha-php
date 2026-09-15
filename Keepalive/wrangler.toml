@@ -1,0 +1,18 @@
+name = "cf-keepalive"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# D1存储
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-keepalive"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# 定时任务
+[triggers]
+crons = ["* * * * *"]
+
+# 不要在这里写密码！用 secret 存更安全
+# [vars]
+# ADMIN_PASSWORD = "明文密码会被提交到代码里，别这么干"
