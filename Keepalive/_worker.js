@@ -165,6 +165,24 @@ async function fetchWithChallenge(url) {
 }
 
 // ============================================================
+// 从响应体中提取 PID 信息
+// ============================================================
+function extractPidInfo(body) {
+  if (!body || typeof body !== 'string') return null;
+  const lines = body.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/运行中/.test(trimmed) || /已自动拉起/.test(trimmed)) {
+      // 取匹配片段，最多 60 字符，避免带入多余内容
+      const m = trimmed.match(/((?:运行中|已自动拉起)[^\r\n]{0,60})/);
+      if (m) return m[1].trim();
+    }
+  }
+  return null;
+}
+
+// ============================================================
 // 数据库初始化
 // ============================================================
 let dbInitPromise = null;
@@ -293,16 +311,36 @@ function shouldSkip(record) {
   return now - (record.last_visit || 0) < (record.interval_sec || 300) * 1000;
 }
 
+// ============================================================
+// 从外部响应体中提取 PID 信息
+// ============================================================
 async function checkOne(db, record, force = false) {
   if (!force && shouldSkip(record)) return { skipped: true };
 
   const r = await fetchWithChallenge(record.url);
   await recordResult(db, record.id, r);
 
+  const pidInfo = extractPidInfo(r.body || '');
+  const isRunning    = pidInfo && /运行中/.test(pidInfo);
+  const isAutoStart  = pidInfo && /已自动拉起/.test(pidInfo);
+  const hasKeyword   = isRunning || isAutoStart;
+
+  let msg;
   const level = r.ok ? 'INFO' : (r.status ? 'WARN' : 'ERROR');
-  let msg = `${r.ok ? 'OK' : 'FAIL'} ${record.url} [${r.status || 'ERR'}]`;
-  if (r.challenged) msg += ' (challenge)';
-  if (r.error) msg += ` ${r.error}`;
+
+  if (r.ok && isAutoStart) {
+    msg = `✅ ${pidInfo} ${record.url}`;
+  } else if (r.ok && isRunning) {
+    msg = `OK ${pidInfo} ${record.url} [${r.status}]`;
+    if (r.challenged) msg += ' (challenge)';
+  } else if (r.ok) {
+    msg = `OK ${record.url} [${r.status}]`;
+    if (r.challenged) msg += ' (challenge)';
+  } else {
+    msg = `FAIL ${record.url} [${r.status || 'ERR'}]`;
+    if (r.challenged) msg += ' (challenge)';
+    if (r.error) msg += ` ${r.error}`;
+  }
 
   await addLog(db, level, msg);
   return r;
