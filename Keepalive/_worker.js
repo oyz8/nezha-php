@@ -22,6 +22,8 @@ const BASE_HEADERS = {
 };
 
 const LOG_KEEP = 500;
+const FAIL_THRESHOLD = 5;
+const RETRY_AFTER_DISABLE_MS = 30 * 60 * 1000;   // 30 分钟
 
 // ============================================================
 // 工具
@@ -177,6 +179,7 @@ function ensureDB(db) {
           interval_sec INTEGER DEFAULT 300,
           fail_count INTEGER DEFAULT 0,
           disabled INTEGER DEFAULT 0,
+          disabled_at INTEGER DEFAULT 0,
           last_visit INTEGER DEFAULT 0,
           last_success INTEGER DEFAULT 0,
           last_status INTEGER DEFAULT 0,
@@ -192,6 +195,10 @@ function ensureDB(db) {
         )`),
         db.prepare(`CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC)`),
       ]);
+
+      try {
+        await db.prepare(`ALTER TABLE urls ADD COLUMN disabled_at INTEGER DEFAULT 0`).run();
+      } catch (e) { /* 字段已存在 */ }
     })().catch(err => {
       dbInitPromise = null;
       throw err;
@@ -244,22 +251,38 @@ async function clearLogs(db) {
 }
 
 async function recordResult(db, id, result) {
-  const ok = result.ok;
-  if (ok) {
+  const row = await db.prepare(
+    `SELECT fail_count, disabled, disabled_at FROM urls WHERE id=?`
+  ).bind(id).first();
+
+  const isManualDisabled = row && row.disabled === 1 && (!row.disabled_at || row.disabled_at === 0);
+
+  if (result.ok) {
     await db.prepare(
-      `UPDATE urls SET fail_count=0, last_visit=?, last_success=?, last_status=?, last_error='' WHERE id=?`
+      `UPDATE urls SET fail_count=0, disabled=0, disabled_at=0,
+       last_visit=?, last_success=?, last_status=?, last_error='' WHERE id=?`
     ).bind(nowMs(), nowSec(), result.status, id).run();
-  } else {
-    const row = await db.prepare(`SELECT fail_count FROM urls WHERE id=?`).bind(id).first();
-    const fails = (row?.fail_count || 0) + 1;
-    const willDisable = fails >= 5 ? 1 : 0;
-    await db.prepare(
-      `UPDATE urls SET fail_count=?, disabled=?, last_visit=?, last_status=?, last_error=? WHERE id=?`
-    ).bind(
-      fails, willDisable, nowMs(), result.status || 0,
-      (result.error || '').slice(0, 200), id
-    ).run();
+    return;
   }
+
+  if (isManualDisabled) {
+    await db.prepare(
+      `UPDATE urls SET last_visit=?, last_status=?, last_error=? WHERE id=?`
+    ).bind(nowMs(), result.status || 0, (result.error || '').slice(0, 200), id).run();
+    return;
+  }
+
+  const fails = (row?.fail_count || 0) + 1;
+  const willDisable = fails >= FAIL_THRESHOLD ? 1 : 0;
+  const disabledAt = willDisable ? nowMs() : 0;
+
+  await db.prepare(
+    `UPDATE urls SET fail_count=?, disabled=?, disabled_at=?,
+     last_visit=?, last_status=?, last_error=? WHERE id=?`
+  ).bind(
+    fails, willDisable, disabledAt, nowMs(), result.status || 0,
+    (result.error || '').slice(0, 200), id
+  ).run();
 }
 
 // ============================================================
@@ -287,14 +310,26 @@ async function checkOne(db, record, force = false) {
 
 async function checkAll(db, force = false) {
   const urls = await listUrls(db);
+  const now = nowMs();
   const results = [];
+
   for (const u of urls) {
+    let forceThis = force;
+
     if (u.disabled && !force) {
-      results.push({ id: u.id, url: u.url, skipped: true, reason: 'disabled' });
-      continue;
+      const canRetry = u.disabled_at && u.disabled_at > 0
+                    && (now - u.disabled_at) >= RETRY_AFTER_DISABLE_MS;
+
+      if (!canRetry) {
+        results.push({ id: u.id, url: u.url, skipped: true, reason: 'disabled' });
+        continue;
+      }
+
+      forceThis = true;
     }
+
     try {
-      const r = await checkOne(db, u, force);
+      const r = await checkOne(db, u, forceThis);
       results.push({ id: u.id, url: u.url, ...r });
     } catch (e) {
       results.push({ id: u.id, url: u.url, error: e.message });
@@ -383,6 +418,34 @@ async function handleAPI(request, env, path) {
     await deleteUrl(db, body.id);
     if (row) await addLog(db, 'INFO', `DELETE ${row.url}`);
     return jsonResponse({ success: true });
+  }
+
+  // 启用/禁用切换
+  if (method === 'POST' && path === '/toggle') {
+    let body;
+    try { body = await request.json(); } catch {
+      return jsonResponse({ error: 'invalid json' }, 400);
+    }
+    if (!body.id) return jsonResponse({ error: '缺少 id' }, 400);
+
+    const row = await db.prepare(
+      `SELECT url, disabled FROM urls WHERE id=?`
+    ).bind(body.id).first();
+    if (!row) return jsonResponse({ error: 'not found' }, 404);
+
+    if (row.disabled) {
+      await db.prepare(
+        `UPDATE urls SET disabled=0, disabled_at=0, fail_count=0 WHERE id=?`
+      ).bind(body.id).run();
+      await addLog(db, 'INFO', `ENABLE ${row.url}`);
+      return jsonResponse({ success: true, disabled: 0 });
+    } else {
+      await db.prepare(
+        `UPDATE urls SET disabled=1, disabled_at=0 WHERE id=?`
+      ).bind(body.id).run();
+      await addLog(db, 'INFO', `DISABLE (manual) ${row.url}`);
+      return jsonResponse({ success: true, disabled: 1 });
+    }
   }
 
   if (method === 'POST' && path === '/check') {
@@ -542,7 +605,7 @@ body {
 /* ── GitHub 角标 ── */
 .github-corner {
   position: fixed; top: 0; right: 0;
-  z-index: 1100;                 /* ★ 高于登录遮罩(1000)，登录页也可见 */
+  z-index: 1100;
   line-height: 0; display: block;
 }
 .github-corner svg { width: 80px; height: 80px; border: 0; display: block; }
@@ -568,7 +631,6 @@ body {
   .github-corner:hover .gh-arm { animation: none; }
   .github-corner .gh-arm { animation: octocat-wave 560ms ease-in-out; }
 }
-/* 窄视口下给 header 右侧留出角标空间 */
 @media (max-width: 1180px) {
   .header { padding-right: 70px; }
 }
@@ -696,6 +758,7 @@ tbody tr:hover { background: var(--table-row-hover); }
 .empty { padding: 24px; text-align: center; color: var(--text-muted); }
 .site-footer { text-align: center; font-size: 12px; color: var(--text-muted); padding-top: 22px; line-height: 1.8; }
 .flex-between { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 8px; flex-wrap: wrap; }
+.actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -744,7 +807,7 @@ tbody tr:hover { background: var(--table-row-hover); }
 
   <section class="hero">
     <h1>URL 保活监控</h1>
-    <p class="lead">定时访问 URL，自动处理 JS 挑战（aes.js）。支持手动触发、失败计数、5 次失败自动禁用。</p>
+    <p class="lead">定时访问 URL，自动处理 JS 挑战（aes.js）。失败 5 次自动禁用，30 分钟后自动重试；支持手动启用/禁用。</p>
   </section>
 
   <section class="card">
@@ -772,11 +835,11 @@ tbody tr:hover { background: var(--table-row-hover); }
             <th style="width: 60px;">ID</th>
             <th>URL</th>
             <th style="width: 90px;">间隔</th>
-            <th style="width: 110px;">状态</th>
+            <th style="width: 130px;">状态</th>
             <th style="width: 80px;">失败次数</th>
             <th style="width: 160px;">最后访问</th>
             <th style="width: 160px;">最后成功</th>
-            <th style="width: 150px;">操作</th>
+            <th style="width: 200px;">操作</th>
           </tr>
         </thead>
         <tbody id="tbody">
@@ -909,10 +972,23 @@ function renderUrls(urls) {
   for (var i = 0; i < urls.length; i++) {
     var u = urls[i];
     var status;
-    if (u.disabled) status = '<span class="badge badge-disabled">已禁用</span>';
-    else if (u.fail_count > 0) status = '<span class="badge badge-fail">失败 ' + u.fail_count + '</span>';
-    else if (u.last_success) status = '<span class="badge badge-ok">正常</span>';
-    else status = '<span class="badge badge-idle">未检查</span>';
+    if (u.disabled) {
+      if (u.disabled_at && u.disabled_at > 0) {
+        status = '<span class="badge badge-disabled" title="失败 ' + u.fail_count + ' 次，30 分钟后自动重试">自动禁用</span>';
+      } else {
+        status = '<span class="badge badge-disabled" title="手动禁用，需手动启用">手动禁用</span>';
+      }
+    } else if (u.fail_count > 0) {
+      status = '<span class="badge badge-fail">失败 ' + u.fail_count + '</span>';
+    } else if (u.last_success) {
+      status = '<span class="badge badge-ok">正常</span>';
+    } else {
+      status = '<span class="badge badge-idle">未检查</span>';
+    }
+
+    var toggleBtn = u.disabled
+      ? '<button class="btn-primary btn-xs" data-act="toggle" data-id="' + u.id + '">启用</button>'
+      : '<button class="btn-ghost btn-xs" data-act="toggle" data-id="' + u.id + '">禁用</button>';
 
     html += '<tr>' +
       '<td>' + u.id + '</td>' +
@@ -922,10 +998,11 @@ function renderUrls(urls) {
       '<td>' + u.fail_count + '</td>' +
       '<td>' + fmtTime(u.last_visit) + '</td>' +
       '<td>' + fmtTime(u.last_success) + '</td>' +
-      '<td>' +
-        '<button class="btn-ghost btn-xs" data-act="check" data-id="' + u.id + '">检查</button> ' +
+      '<td><div class="actions-cell">' +
+        '<button class="btn-ghost btn-xs" data-act="check" data-id="' + u.id + '">检查</button>' +
+        toggleBtn +
         '<button class="btn-danger btn-xs" data-act="del" data-id="' + u.id + '">删除</button>' +
-      '</td>' +
+      '</div></td>' +
     '</tr>';
   }
   tb.innerHTML = html;
@@ -988,6 +1065,8 @@ $('tbody').addEventListener('click', async function(ev) {
       await api('/delete', 'POST', { id: id });
     } else if (act === 'check') {
       await api('/check-one', 'POST', { id: id });
+    } else if (act === 'toggle') {
+      await api('/toggle', 'POST', { id: id });
     }
     await refresh();
   } catch (e) {
