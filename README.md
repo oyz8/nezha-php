@@ -24,9 +24,9 @@
 ## 架构总览
 
 ```
-保活服务（任意定时访问工具）          任意 PHP 主机              byethost 目标
+   保活服务（任意定时访问工具）          任意 PHP 主机            byethost 目标
    CF Worker / Uptime Kuma /     ──▶   keepalive.php     ──▶   /manage_action.shtml
-   cron+curl         （处理 aes.js 挑战）       ?act=autostart
+   cron+curl                           （处理 aes.js 挑战）      ?act=autostart
 ```
 
 **两条原则：**
@@ -62,8 +62,6 @@ $SECRET  = 'admin123';   // ← 改成你自己的随机密钥
 $TIMEOUT = 15;
 ```
 
-生成随机密钥：`openssl rand -hex 16`
-
 ### 2. 上传
 
 把 `Keepalive/keepalive.php` 上传到任意 PHP 主机的 `~/www/`（CT8、SERV00、alwaysdata 等）。
@@ -91,7 +89,7 @@ OK http://abc.byethost5.com/manage_action.shtml?act=autostart [200] (challenge)
 
 保活服务只需做一件事：**定时对第二章生成的 PHP URL 发 GET**。
 
-### 方案 1：本项目 CF Worker（推荐）
+### 方案 1：本项目 CF Worker
 
 **部署步骤：**
 
@@ -113,7 +111,7 @@ OK http://abc.byethost5.com/manage_action.shtml?act=autostart [200] (challenge)
 ```bash
 curl -X POST "https://keep.yourdomain.com/add-url" \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://你的PHP主机/keepalive.php?key=admin123&target=http://abc.byethost5.com/manage_action.shtml?act=autostart"}'
+  -d '{"url":"http://abc.byethost5.com/manage_action.shtml?act=autostart"}'
 ```
 
 返回 `{"success": true}` 即成功。
