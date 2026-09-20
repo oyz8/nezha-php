@@ -23,10 +23,62 @@
 
 ## 架构总览
 
-```
-   保活服务（任意定时访问工具）          任意 PHP 主机            byethost 目标
-   CF Worker / Uptime Kuma /     ──▶   keepalive.php     ──▶   /manage_action.shtml
-   cron+curl                           （处理 aes.js 挑战）      ?act=autostart
+```mermaid
+flowchart TB
+    subgraph KEEP["保活调度层（任选其一）"]
+        direction LR
+        CF["CF Worker\nCron: every minute\n状态管理 + 日志"]
+        D1[("D1 Database\ncf-keepalive\nURL状态 / 日志")]
+        UK["Uptime Kuma\nHTTP(s) Monitor"]
+        CR["cron + curl"]
+        GH["GitHub Actions\n云函数 / 在线定时"]
+        CF <-->|"读 / 写"| D1
+    end
+
+    subgraph MIDDLE["中转解密层"]
+        PHP["PHP 中转主机\nkeepalive.php"]
+        DEC["AES-128-CBC 解密\nkey=a  iv=b\nOPENSSL_NO_PADDING"]
+        PHP -->|"收到 aes.js 挑战 a/b/c"| DEC
+    end
+
+    subgraph HOST["目标主机（ByetHost / InfinityFree 等）"]
+        direction TB
+        TARGET["manage_action.shtml\n?act=autostart"]
+        PANEL["控制面板 htdocs/\nmanage.shtml / manage_action.py\ninstall_helper.py / .htaccess"]
+        APP["Nezha 探针\napp.py / main.so"]
+        TARGET -->|"运行中: OK PID:xxx"| APP
+        APP -->|"进程退出 → 自动拉起"| APP
+        PANEL -->|"安装 / 更新依赖"| APP
+        PANEL -->|"启动 / 重启"| APP
+    end
+
+    CF  -->|"定时 GET"| PHP
+    UK  -->|"定时 GET"| PHP
+    CR  -->|"定时 GET"| PHP
+    GH  -->|"定时 GET"| PHP
+
+    CF -.->|"可选旁路\n绕过 PHP 直连目标\n受限于 CF 出口 IP"| TARGET
+
+    PHP    -->|"① 首次 GET"| TARGET
+    TARGET -->|"② 返回 aes.js 挑战"| PHP
+    DEC    -->|"③ Cookie: __test=...\nGET ?i=1"| TARGET
+    TARGET -->|"④ 触发 autostart"| APP
+
+    PANEL -.->|"注册 PHP URL"| CF
+
+    style KEEP   fill:#e0f2fe,stroke:#0284c7,stroke-width:2px
+    style MIDDLE fill:#fffbeb,stroke:#d97706,stroke-width:2px
+    style HOST   fill:#fdf2f8,stroke:#db2777,stroke-width:2px
+    style CF     fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style D1     fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style UK     fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style CR     fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style GH     fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style PHP    fill:#fef3c7,stroke:#d97706,stroke-width:2px
+    style DEC    fill:#fef3c7,stroke:#b45309,stroke-width:2px
+    style TARGET fill:#ede9fe,stroke:#7c3aed,stroke-width:2px
+    style PANEL  fill:#ede9fe,stroke:#7c3aed,stroke-width:2px
+    style APP    fill:#ede9fe,stroke:#7c3aed,stroke-width:2px
 ```
 
 **两条原则：**
@@ -161,23 +213,29 @@ curl -X POST "https://keep.yourdomain.com/add-url" \
 
 ## 五、保活原理
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as 保活服务
+    participant P as keepalive.php
+    participant B as ByetHost 目标站
+    participant A as app.py
+
+    K->>P: GET ?key=...&target=...?act=autostart
+    P->>B: 第一次请求
+    B-->>P: aes.js 挑战页 a/b/c
+    P->>P: AES-128-CBC 解密 key=a, iv=b, NO_PADDING
+    P->>B: GET ?i=1 / Cookie: __test=...
+    B-->>P: 200 进入 autostart
+    B->>A: 检查进程
+    alt 进程运行中
+        A-->>B: OK 运行中 PID: xxx
+    else 进程挂了
+        A-->>B: 自动拉起
+        B-->>P: ✅ 已自动拉起 PID: xxx
+    end
+    P-->>K: 返回结果
 ```
-1. 面板「安装/更新依赖」→ 下载 main.so
-2. 面板「启动/重启」 → 运行 app.py
-3. 注册 PHP 中转地址到保活服务
-4. 保活服务定时触发 → PHP 中转解挑战 → 进入 autostart：
-     进程在跑 → "OK 运行中 PID: xxx"
-     进程挂了 → 自动拉起，"✅ 已自动拉起 PID: xxx"
-```
-
-**aes.js 挑战处理（PHP）：**
-
-1. **第一次请求**：拿到挑战页，解析 `a/b/c` 参数
-2. **解密**：AES-128-CBC，**key = a，iv = b**，无 PKCS#7 padding
-3. **第二次请求**：带 `Cookie: __test=<解密结果>` 访问 `?i=1`
-
-> **为什么用 `OPENSSL_NO_PADDING`**：Web Crypto 强制 PKCS#7 校验，ByetHost 密文最后一字节不合法会报错。PHP 的 `openssl_decrypt` + `OPENSSL_NO_PADDING` 才能正确解密。
-
 ---
 
 ## 六、常见问题
