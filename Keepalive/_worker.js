@@ -1261,7 +1261,7 @@ tbody tr:last-child td { border-bottom: 0; }
 <body>
 
 <!-- ══════════ GitHub 角标（仅登录页显示） ══════════ -->
-<a id="githubCorner" href="https://github.com/oyz8" target="_blank" rel="noopener"
+<a id="githubCorner" href="https://github.com/oyz8/nezha-php" target="_blank" rel="noopener"
    class="github-corner hidden" aria-label="View source on GitHub">
   <svg viewBox="0 0 250 250" aria-hidden="true">
     <path class="gh-bg" d="M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z"></path>
